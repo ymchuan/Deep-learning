@@ -1,0 +1,428 @@
+student_1 = '' #@param {type:"string"}  Name of student 1
+Student_2 = '' #@param {type:"string"}  Name of student 2
+Student_3 = '' #@param {type:"string"}  Name of student 3
+Student_4 = '' #@param {type:"string"}  Name of student 4
+
+import warnings
+warnings.filterwarnings('ignore')
+
+# 导入必要库（添加PyTorch，移除TensorFlow/Keras）
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import gymnasium as gym
+import time
+import matplotlib.pyplot as plt
+
+# Import and Explore the Environment
+print("\n--- Exploring the Base Environment ---")
+env = gym.make("CartPole-v1")
+observation, info = env.reset()
+
+# Print information about the environment
+print(f"Initial Observation: {observation}")
+print(f"Action Space: {env.action_space}")  # Discrete actions: 0 (left), 1 (right)
+print(f"Observation Space: {env.observation_space}")  # State variables: cart position, etc.
+
+# Some plotting functions（复用原有，不修改）
+def plot_eval_rwd_mean(eval_mean_list):
+    """Plot evaluation reward mean."""
+    if len(eval_mean_list) == 0:
+        print("eval_mean_list is empty, nothing to plot.")
+        return
+    
+    episodes = range(1, len(eval_mean_list) + 1)
+
+    plt.figure()
+    plt.plot(episodes, eval_mean_list)
+    plt.xlabel("Episode")
+    plt.ylabel("Evaluation Reward (mean)")
+    plt.title("Evaluation Reward Mean per Episode")
+    plt.grid(True)
+    plt.show()
+
+def plot_eval_rwd_var(eval_var_list):
+    """Plot evaluation reward variance."""
+    if len(eval_var_list) == 0:
+        print("eval_var_list is empty, nothing to plot.")
+        return
+
+    episodes = range(1, len(eval_var_list) + 1)
+
+    plt.figure()
+    plt.plot(episodes, eval_var_list)
+    plt.xlabel("Episode")
+    plt.ylabel("Evaluation Reward (variance)")
+    plt.title("Evaluation Reward Variance per Episode")
+    plt.grid(True)
+    plt.show()
+
+def plot_smoothed_training_rwd(train_rwd_list, window_size=20):
+    """Plot smoothed training rewards using a moving average."""
+    n = len(train_rwd_list)
+    if n == 0:
+        print("train_rwd_list is empty, nothing to plot.")
+        return
+    
+    # 如果 episode 数比窗口小，就把窗口缩短
+    window_size = min(window_size, n)
+
+    # 简单的滑动平均
+    smoothed = []
+    for i in range(n - window_size + 1):
+        window = train_rwd_list[i:i + window_size]
+        smoothed.append(sum(window) / window_size)
+
+    # 对应的 episode 编号（从 window_size 开始）
+    episodes = range(window_size, n + 1)
+
+    plt.figure()
+    plt.plot(episodes, smoothed)
+    plt.xlabel("Episode")
+    plt.ylabel(f"Training Reward (moving average, window={window_size})")
+    plt.title("Smoothed Training Reward")
+    plt.grid(True)
+    plt.show()
+
+# 复用原有evaluation函数（不修改，依赖model.predict接口）
+def evaluation(model, max_timesteps=500):
+    eval_env = gym.make("CartPole-v1")
+    state_size = eval_env.observation_space.shape[0] # Number of observations (CartPole)
+    action_size = eval_env.action_space.n            # Number of possible actions
+    eval_reward = []
+
+    for i in range (5):
+        round_reward = 0
+        state, _ = eval_env.reset()
+        state = np.reshape(state, [1, state_size])
+
+        for i in range(max_timesteps):
+            action = np.argmax(model.predict(state, verbose=0)[0])
+            next_state, reward, terminated, truncated, _ = eval_env.step(action)
+            next_state = np.reshape(next_state, [1, state_size])
+
+            round_reward += reward
+            state = next_state
+
+            if terminated or truncated:
+                eval_reward.append(round_reward)
+                break
+
+    eval_env.close()
+
+    eval_reward_mean = np.sum(eval_reward)/len(eval_reward)
+    eval_reward_var = np.var(eval_reward)
+
+    return eval_reward_mean, eval_reward_var
+
+# 基础超参数（复用原有，不修改）
+lr =  0.001        #@param {type:"number"}               # learning rate
+epoch =  1     #@param {type:"number"}               # epochs
+episode = 250  #@param {type:"number"}               # episodes
+
+epsilon = 1           #@param {type:"number"}     # Starting exploration rate
+epsilon_min = 0.01    #@param {type:"number"}     # Exploration rate min
+epsilon_decay = 0.995     #@param {type:"number"}     # Exploration rate decay
+
+gamma = 0.99          #@param {type:"number"}     # Agent discount factor
+
+ba =  32       #@param {type:"number"}               # batch_size
+target_update_freq = 50 # @param {type:"number"}    # Target network update frequency
+
+# -------------------------- 核心适配：伪模型类（Q表用，不修改） --------------------------
+class QTablePseudoModel:
+    """伪模型类：适配原evaluation函数的model.predict调用，内部用Q表实现"""
+    def __init__(self, Q_table, state_bounds, num_bins):
+        self.Q_table = Q_table          # 真实Q表
+        self.state_bounds = state_bounds# 状态边界
+        self.num_bins = num_bins        # 离散区间数
+
+    def discretize_state(self, state):
+        """内部离散化函数：与训练时的离散化逻辑完全一致"""
+        discretized = []
+        for s, (low, high) in zip(state.flatten(), self.state_bounds):
+            s = np.clip(s, low, high)
+            bin_idx = int(np.floor((s - low) / (high - low) * self.num_bins))
+            bin_idx = np.clip(bin_idx, 0, self.num_bins - 1)
+            discretized.append(bin_idx)
+        # 4维→单维索引
+        return discretized[0] * (self.num_bins**3) + discretized[1] * (self.num_bins**2) + discretized[2] * self.num_bins + discretized[3]
+
+    def predict(self, state, verbose=0):
+        """模拟神经网络predict方法：输入连续状态，输出Q值数组（格式：[1, 2]）"""
+        # 离散化连续状态
+        state_discrete = self.discretize_state(state)
+        # 从Q表获取对应状态的Q值，reshape为[1, 2]（与神经网络输出格式一致）
+        q_values = self.Q_table[state_discrete].reshape(1, -1)
+        return q_values
+    
+# 1. 状态离散化函数（Q表用，不修改）
+def discretize_state(state, state_bounds, num_bins):
+    discretized = []
+    for s, (low, high) in zip(state.flatten(), state_bounds):
+        s = np.clip(s, low, high)
+        bin_idx = int(np.floor((s - low) / (high - low) * num_bins))
+        bin_idx = np.clip(bin_idx, 0, num_bins - 1)
+        discretized.append(bin_idx)
+    return discretized[0] * (num_bins**3) + discretized[1] * (num_bins**2) + discretized[2] * num_bins + discretized[3]
+
+# 2. 环境初始化（Q表用，不修改）
+env_qtable = gym.make("CartPole-v1")
+action_size = env_qtable.action_space.n  # 动作数：2
+state_size_continuous = env_qtable.observation_space.shape[0]  # 连续状态维度：4
+
+# 3. 状态边界定义（Q表用，不修改）
+state_bounds = [
+    [-2.4, 2.4],    # 小车位置
+    [-3.0, 3.0],    # 小车速度
+    [-0.209, 0.209],# 杆角度（弧度）
+    [-3.0, 3.0]     # 杆角速度
+]
+
+# 4. Q表初始化（Q表用，不修改）
+num_bins = 10  # 每个维度离散区间数
+discrete_state_num = num_bins ** state_size_continuous  # 10^4 = 10000个离散状态
+Q_table = np.zeros((discrete_state_num, action_size))  # 状态数×动作数
+
+# -------------------------- Q表训练循环（不修改） --------------------------
+train_reward_lst = []
+eval_reward_mean_lst = []
+eval_reward_var_lst = []
+total_training_time = 0
+
+for ep in range(episode):
+    state_continuous, _ = env_qtable.reset()
+    state_discrete = discretize_state(state_continuous, state_bounds, num_bins)
+    total_reward = 0
+    start_time = time.time()
+
+    for _ in range(500):
+        # 1. ε-贪婪选动作
+        if np.random.rand() <= epsilon:
+            action = np.random.choice(action_size)
+        else:
+            action = np.argmax(Q_table[state_discrete, :])
+
+        # 2. 执行动作获取反馈
+        next_state_continuous, reward, terminated, truncated, _ = env_qtable.step(action)
+        next_state_discrete = discretize_state(next_state_continuous, state_bounds, num_bins)
+        done = terminated or truncated
+
+        # 3. Q表更新
+        current_Q = Q_table[state_discrete, action]
+        if done:
+            target_Q = reward
+        else:
+            max_next_Q = np.max(Q_table[next_state_discrete, :])
+            target_Q = reward + gamma * max_next_Q
+        Q_table[state_discrete, action] += lr * (target_Q - current_Q)
+
+        # 4. 探索率衰减
+        if epsilon > epsilon_min:
+            epsilon *= epsilon_decay
+
+        # 5. 状态更新与奖励累计
+        state_discrete = next_state_discrete
+        total_reward += reward
+        if done:
+            break
+
+    # 记录训练时间
+    end_time = time.time()
+    total_training_time += (end_time - start_time)
+
+    # 6. 评估策略
+    pseudo_model = QTablePseudoModel(Q_table, state_bounds, num_bins)
+    eval_mean, eval_var = evaluation(pseudo_model)
+
+    # 7. 打印日志
+    print(f"\nQ-Table Episode {ep + 1}/{episode} | Ep. Total Reward: {total_reward:.0f}"
+          f" | Epsilon : {epsilon:.3f}"
+          f" | Eval Rwd Mean: {eval_mean:.2f}"
+          f" | Eval Rwd Var: {eval_var:.2f}")
+
+    # 8. 日志存储
+    train_reward_lst.append(total_reward)
+    eval_reward_mean_lst.append(eval_mean)
+    eval_reward_var_lst.append(eval_var)
+
+    # 9. 早停逻辑
+    if eval_mean >= 500:
+        print(f"Early stopping triggered at Episode {ep + 1}.")
+        break
+
+# 计算平均训练时间
+avg_train_time = total_training_time / (ep + 1)
+print(f"\nQ-Table Average Training Time: {avg_train_time:.4f} seconds per episode")
+env_qtable.close()
+
+# -------------------------- 以下是修改后的Q-Network-Alternative（PyTorch版本） --------------------------
+# 调优后的超参数（完全复用原有，不修改）
+lr_alt = 8e-4        # 慢学习率：减少单步更新震荡
+epoch_alt = 1           # 单步更新：纯基础Q-Network标准配置
+episodes_alt = 500      # 延长训练轮次：配合慢学习率
+epsilon_alt = 1.0       # 初始全探索
+epsilon_min_alt = 0.01  # 提升最小探索率：避免策略停滞
+epsilon_decay_alt = 0.9995  # 极慢衰减：延长有效探索期
+gamma_alt = 0.99        # 高折扣因子：强化长期奖励
+hidden_units1_alt = 128  # 精简网络容量：16×16避免过拟合
+hidden_units2_alt = 128
+device = torch.device("cpu")  # Mac默认CPU，有GPU可改为"cuda"
+
+# -------------------------- 第一板块：PyTorch模型构建（复现调优架构） --------------------------
+class QNetworkPyTorch(nn.Module):
+    """PyTorch Q网络：1:1复现原Keras调优架构（Leaky ReLU+He初始化）"""
+    def __init__(self, state_size, action_size, hidden1, hidden2):
+        super(QNetworkPyTorch, self).__init__()
+        # 网络层：与原Keras Dense层完全对应
+        self.fc1 = nn.Linear(state_size, hidden1)
+        self.fc2 = nn.Linear(hidden1, hidden2)
+        self.fc3 = nn.Linear(hidden2, action_size)
+        # 激活函数：Leaky ReLU（negative_slope=0.01，与Keras默认一致）
+        self.leaky_relu = nn.LeakyReLU(negative_slope=0.01)
+        # 权重初始化：He均匀初始化（匹配Keras的he_uniform）
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """复现Keras的he_uniform初始化逻辑"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_uniform_(m.weight, mode='fan_in', nonlinearity='leaky_relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)  # 偏置初始化为0，与Keras一致
+
+    def forward(self, x):
+        """前向传播：复现Keras的计算流程"""
+        x = self.leaky_relu(self.fc1(x))
+        x = self.leaky_relu(self.fc2(x))
+        q_values = self.fc3(x)  # 输出层无激活（线性激活，Q值回归）
+        return q_values
+
+    def predict(self, state_np, verbose=0):
+        """适配原evaluation函数的predict接口：输入numpy数组，输出numpy数组"""
+        self.eval()  # 评估模式（禁用梯度计算）
+        with torch.no_grad():
+            # 转换numpy数组→PyTorch张量（float32，匹配Keras输入格式）
+            state_tensor = torch.tensor(state_np, dtype=torch.float32).to(device)
+            # 前向传播获取Q值
+            q_values_tensor = self.forward(state_tensor)
+            # 张量→numpy数组（保持输出形状[1, action_size]，与Keras一致）
+            q_values_np = q_values_tensor.cpu().numpy()
+        self.train()  # 恢复训练模式
+        return q_values_np
+
+# 1. 环境初始化（与原一致）
+env_alt = gym.make("CartPole-v1")
+state_size_alt = env_alt.observation_space.shape[0]  # 4维状态
+action_size_alt = env_alt.action_space.n            # 2维动作
+
+# 2. 实例化PyTorch模型、优化器、损失函数（复现原Keras配置）
+model_alt = QNetworkPyTorch(state_size_alt, action_size_alt, hidden_units1_alt, hidden_units2_alt).to(device)
+optimizer = optim.Adam(model_alt.parameters(), lr=lr_alt)  # Adam优化器，相同学习率
+criterion = nn.MSELoss()  # MSE损失，与Keras的loss='mean_squared_error'一致
+
+# 打印模型结构（验证与原Keras架构一致）
+print("\n--- Q-Network-Alternative (PyTorch) Structure ---")
+print(model_alt)
+
+# -------------------------- 第二板块：PyTorch训练循环（复现原逻辑） --------------------------
+# 日志存储列表
+train_rewards_alt = []
+eval_means_alt = []
+eval_vars_alt = []
+total_training_time_alt = 0
+current_epsilon = epsilon_alt  # 初始化探索率
+
+for ep in range(episodes_alt):
+    # 重置环境
+    state, _ = env_alt.reset()
+    state = np.reshape(state, [1, state_size_alt])
+    episode_reward_alt = 0
+    start_time = time.time()
+
+    for step in range(500):  # 每轮最大步数500
+        # 1. ε-贪婪动作选择（与原逻辑完全一致）
+        if np.random.rand() <= current_epsilon:
+            action = np.random.choice(action_size_alt)  # 探索
+        else:
+            # 调用自定义predict方法，与原Keras接口一致
+            q_values_alt = model_alt.predict(state, verbose=0)
+            action = np.argmax(q_values_alt[0])  # 利用
+
+        # 2. 执行动作，获取环境反馈（与原一致）
+        next_state, reward, terminated, truncated, _ = env_alt.step(action)
+        next_state = np.reshape(next_state, [1, state_size_alt])
+        done = terminated or truncated
+
+        # 3. 计算目标Q值（复现原贝尔曼方程）
+        # 当前Q值：调用predict获取（保持与原逻辑一致）
+        current_q_alt = model_alt.predict(state, verbose=0)
+        if done:
+            target_q_alt = reward  # 终止状态：无未来奖励
+        else:
+            # 下一个状态Q值：调用predict获取
+            next_q_alt = model_alt.predict(next_state, verbose=0)
+            target_q_alt = reward + gamma_alt * np.max(next_q_alt)  # 贝尔曼方程
+
+        # 4. 构造目标张量（仅更新当前动作的Q值，其余保持不变）
+        target_q_tensor = torch.tensor(current_q_alt, dtype=torch.float32).to(device)
+        target_q_tensor[0][action] = target_q_alt  # 复现原Keras的目标Q值构造逻辑
+
+        # 5. 单步训练（PyTorch手动实现反向传播）
+        optimizer.zero_grad()  # 清空梯度（Keras自动处理）
+        outputs = model_alt.forward(torch.tensor(state, dtype=torch.float32).to(device))
+        loss = criterion(outputs, target_q_tensor)  # 计算MSE损失
+        loss.backward()  # 反向传播（Keras自动处理）
+        optimizer.step()  # 更新参数（Keras自动处理）
+
+        # 6. 探索率衰减（与原逻辑一致）
+        if current_epsilon > epsilon_min_alt:
+            current_epsilon *= epsilon_decay_alt
+
+        # 7. 状态更新与奖励累计（与原一致）
+        state = next_state
+        episode_reward_alt += reward
+        if done:
+            break
+
+    # 记录训练时间
+    end_time = time.time()
+    total_training_time_alt += (end_time - start_time)
+
+    # 8. 评估当前模型（直接复用原evaluation函数，无修改！）
+    eval_mean_alt, eval_var_alt = evaluation(model_alt)
+
+    # 9. 打印日志（保持原格式，便于对比）
+    print(f"\nQ-Net-Alt Episode {ep + 1}/{episodes_alt} | "
+          f"Training Reward: {episode_reward_alt:.0f} | "
+          f"Epsilon: {current_epsilon:.3f} | "
+          f"Eval Mean: {eval_mean_alt:.2f} | "
+          f"Eval Var: {eval_var_alt:.2f}")
+
+    # 10. 日志存储（与原一致）
+    train_rewards_alt.append(episode_reward_alt)
+    eval_means_alt.append(eval_mean_alt)
+    eval_vars_alt.append(eval_var_alt)
+
+    # 11. 早停逻辑（与原一致）
+    if eval_mean_alt >= 500:
+        print(f"\nEarly Stopping Triggered! Converged at Episode {ep + 1}")
+        break
+
+# 计算平均训练时间
+avg_train_time_alt = total_training_time_alt / (ep + 1)
+print(f"\nQ-Net-Alt Average Training Time: {avg_train_time_alt:.4f} seconds per episode")
+
+# 环境清理
+env_alt.close()
+
+# -------------------------- 结果可视化（复用原有函数） --------------------------
+print("\n--- Q-Network-Alternative (PyTorch) Results ---")
+plot_smoothed_training_rwd(train_rewards_alt, window_size=20)
+plot_eval_rwd_mean(eval_means_alt)
+plot_eval_rwd_var(eval_vars_alt)
+
+# （可选）保存PyTorch模型
+# torch.save(model_alt.state_dict(), "q_network_alternative_pytorch.pth")
+# 加载模型：model_alt.load_state_dict(torch.load("q_network_alternative_pytorch.pth"))
