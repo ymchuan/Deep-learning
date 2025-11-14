@@ -1,0 +1,372 @@
+\documentclass[11pt,a4paper]{article}
+
+% 基础宏包
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{caption} % 用于表格和图的标题
+\usepackage{subcaption} % 用于子图
+\usepackage{float} % 用于 [H] 强制位置
+\usepackage{algorithm} % 用于算法环境
+\usepackage{algorithmic} % 用于算法内容
+\usepackage{cite} % 用于参考文献引用
+\usepackage{xcolor}
+
+% HYPERREF 宏包必须放在最后，以避免与上述宏包产生冲突，这是标准格式要求。
+\usepackage{hyperref} 
+
+% Hyperref settings
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    filecolor=magenta,      
+    urlcolor=cyan,
+    citecolor=green,
+}
+
+% Title information
+\title{\textbf{EEC4400 Assignment Report} \\ 
+\large Exploring Reinforcement Learning: Q-Learning, Naïve DQN, DQN and DDQN for Cart-Pole}
+\author{Group 04 \\ 
+Student 1 Peng Kehan (CEG25049)  \\
+Student 2 Yang Mingchuan (CEG25083)  \\
+Student 3 Yu Chijin (CEG25089)  \\
+Student 4 Liu Pengxiang (CEG25039) }
+\date{Semester 1, AY2025/26}
+
+\begin{document}
+
+\maketitle
+
+%==============================================================================
+\begin{abstract}
+%==============================================================================
+
+This report investigates the performance of four value-based deep reinforcement learning algorithms—Q-Network, Naïve DQN, DQN, and Double DQN (DDQN)—on the CartPole-v1 control task. We implement two sets of policies: "Baseline" policies using ReLU activation and "Alternative" policies primarily using Tanh activation, along with other tuned hyperparameters. Our experiments reveal significant findings regarding stability: the Baseline Q-Network (ReLU) and, notably, the Baseline DQN (ReLU) policies failed to converge, yielding final evaluation rewards of 12.0 and 9.0, respectively. In contrast, the Baseline DDQN (ReLU) achieved a perfect score (500.0), demonstrating its ability to correct the instability present in DQN. Furthermore, the introduction of Tanh activation in the "Alternative" policies resolved the convergence issues for both Naïve DQN and DQN, raising their performance from 155.0 and 9.0 to the maximum 500.0. This highlights the critical impact of architectural choices (like activation functions) and algorithmic enhancements (like Double Q-learning) on training stability and final performance.
+
+\end{abstract}
+
+% Optional: Table of Contents for longer reports
+% \tableofcontents
+% \newpage
+
+%==============================================================================
+\section{Introduction}
+%==============================================================================
+
+Reinforcement learning (RL) is a fundamental paradigm in machine learning where agents learn to make sequential decisions through trial and error by interacting with an environment. Among value-based deep RL methods, Deep Q-Networks (DQN) and its variants have demonstrated significant success in control tasks, particularly after the breakthrough work by Mnih et al. in 2013 showing superhuman performance on Atari games.
+
+This report presents the implementation and comparative analysis of four value-based deep RL algorithms: Q-Network, Naïve DQN, DQN, and Double DQN (DDQN) on the CartPole-v1 environment. We employ a shared neural network architecture and evaluate baseline hyperparameters to ensure fair comparison across algorithms. The progression from Q-Network to DDQN illustrates how key innovations—experience replay, target networks, and double Q-learning—address fundamental challenges in deep reinforcement learning such as sample correlation, training instability, and overestimation bias. The report is structured as follows: Section 2 describes the problem setup and experimental configuration, Section 3 presents the methodology and results for each algorithm, Section 4 provides cross-policy comparison, and Section 5 concludes with discussion and limitations.
+
+%==============================================================================
+\section{Problem Setup \& Experimental Configuration}
+%==============================================================================
+
+%------------------------------------------------------------------------------
+\subsection{CartPole-v1 Environment}
+%------------------------------------------------------------------------------
+
+The CartPole-v1 environment is a classic control problem where the goal is to balance a pole on a moving cart by applying horizontal forces. The state space consists of a 4-dimensional continuous vector containing: (1) cart position, (2) cart velocity, (3) pole angle from vertical, and (4) pole angular velocity. The agent can take one of two discrete actions at each timestep: push the cart left (action 0) or push the cart right (action 1).
+
+The environment provides a reward of +1 for each timestep the pole remains balanced. An episode terminates when: (1) the pole angle exceeds $\pm$12°, (2) the cart position exceeds $\pm$2.4 units from the center, or (3) the episode reaches the maximum length of 500 timesteps. The maximum achievable reward per episode is therefore 500. The environment is considered "solved" when the agent achieves an average reward of 195 or higher over 100 consecutive episodes.
+
+%------------------------------------------------------------------------------
+\subsection{Shared Neural Network Architecture}
+%------------------------------------------------------------------------------
+
+To ensure fair comparison, all algorithms share a similar neural network architecture for Q-value approximation. The network is a fully connected feedforward network with the following structure:
+
+\begin{itemize}
+    \item \textbf{Input layer}: 4 neurons (corresponding to the 4 state features)
+    \item \textbf{Hidden layer 1}: 128 neurons
+    \item \textbf{Output layer}: 2 neurons with linear activation (Q-values for each action)
+\end{itemize}
+
+A key variable in our investigation is the activation function used in the hidden layer. The **Baseline (NN-hp-set1)** policies use **ReLU** (Rectified Linear Unit). The **Alternative (NN-hp-set2)** policies use **Tanh** (Hyperbolic Tangent). This architectural change is the primary differentiator for our comparative analysis.
+
+%------------------------------------------------------------------------------
+\subsection{Shared Hyperparameters}
+%------------------------------------------------------------------------------
+
+We identify two groups of hyperparameters: neural network (NN) hyperparameters and reinforcement learning (RL) hyperparameters.
+
+\subsubsection{Neural Network Hyperparameters}
+
+\begin{table}[H]
+\centering
+\caption{Neural Network Hyperparameters}
+\label{tab:nn_hyperparams}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Hyperparameter} & \textbf{NN-hp-set1 (Baseline)} & \textbf{NN-hp-set2 (Alternative)} \\ \midrule
+Optimizer & Adam & Adam \\
+Learning Rate & 0.0005 & Varied (see Sec 3) \\
+Batch Size & 64 & Varied (see Sec 3) \\
+Loss Function & MSE & MSE \\
+\textbf{Activation Function} & \textbf{ReLU} & \textbf{Tanh} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The Adam optimizer and MSE loss are used consistently. The key change in NN-hp-set2 is the Tanh activation. Learning rate and batch size were tuned individually for alternative policies as described in Section 3.
+
+\subsubsection{Reinforcement Learning Hyperparameters}
+
+\begin{table}[H]
+\centering
+\caption{Reinforcement Learning Hyperparameters}
+\label{tab:rl_hyperparams}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Hyperparameter} & \textbf{RL-hp-set1 (Baseline)} & \textbf{RL-hp-set2 (Alternative)} \\ \midrule
+Discount Factor ($\gamma$) & 0.99 & 0.99 \\
+Epsilon Start & 1.0 & 1.0 \\
+Epsilon Decay & 0.995 & Varied (see Sec 3) \\
+Epsilon Min & 0.01 & 0.01 \\
+Replay Buffer Size & 10,000 & Varied (see Sec 3) \\
+Target Network Update (steps) & 10 & 10 \\
+Training Episodes & 500 & 500 \\
+Max Steps per Episode & 500 & 500 \\
+Evaluation Episodes & 5 & 5 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The baseline hyperparameters represent commonly used values in DQN literature. The discount factor $\gamma=0.99$ emphasizes long-term rewards. The epsilon-greedy exploration strategy starts at 1.0 (pure exploration) and decays by 0.995 per episode to a minimum of 0.01, balancing exploration and exploitation. The replay buffer size of 10,000 experiences provides sufficient diversity for breaking correlation while remaining memory-efficient. For DQN and DDQN, the target network is updated every 10 training steps to stabilize learning.
+
+Baseline RL hyperparameters were fixed. For the alternative set, key parameters like epsilon decay and buffer size were adjusted to optimize performance in conjunction with the Tanh activation.
+
+%==============================================================================
+\section{Methodology and Results}
+%==============================================================================
+
+In this section, we present the results for each of the four algorithms, comparing the Baseline (ReLU) implementation against its corresponding Alternative (Tanh) implementation. All final evaluation reward values are sourced from the provided \texttt{ipynb} file.
+
+%------------------------------------------------------------------------------
+\subsection{Q-Network (Student 1)}
+%------------------------------------------------------------------------------
+
+\subsubsection{Algorithm Description}
+The Q-Network is the simplest algorithm, using a neural network $Q_\theta(s,a)$ for Q-value approximation. It updates at every step using the current experience, without an experience replay buffer or a target network.
+\begin{equation}
+    \mathcal{L}(\theta) = \mathbb{E}\left[\left(r + \gamma \max_{a'} Q_\theta(s', a') - Q_\theta(s, a)\right)^2\right]
+\end{equation}
+
+\subsubsection{Implementations and Results}
+\paragraph{Baseline (ReLU)}
+The baseline Q-Network used the standard ReLU activation and $\epsilon_{decay}=0.995$. Due to highly correlated updates and the moving target problem, this policy failed to learn. The training was highly unstable, and the final evaluation mean reward was only \textbf{12.00}.
+
+\paragraph{Alternative (Tanh)}
+The alternative policy used Tanh activation, $\epsilon_{decay}=0.999$, and a learning rate of $4e-4$. This configuration showed slightly more stable learning, achieving a final evaluation mean reward of \textbf{46.00}.
+
+\paragraph{Discussion}
+Both Q-Network policies failed to converge, demonstrating the critical need for mechanisms to stabilize training. The Tanh activation provided a marginal improvement over ReLU, but not enough to overcome the fundamental flaws of learning from sequential, correlated experiences.
+
+%------------------------------------------------------------------------------
+\subsection{Naïve DQN with Experience Replay (Student 2)}
+%------------------------------------------------------------------------------
+
+\subsubsection{Algorithm Description}
+Naïve DQN introduces an experience replay buffer $\mathcal{D}$. At each step, it samples a mini-batch of past experiences to break temporal correlations. It still uses a single network $Q_\theta$ for both Q-value estimation and target calculation.
+\begin{equation}
+    \mathcal{L}(\theta) = \mathbb{E}_{(s,a,r,s',done) \sim \mathcal{D}}\left[\left(r + \gamma (1-done) \cdot \max_{a'} Q_\theta(s', a') - Q_\theta(s, a)\right)^2\right]
+\end{equation}
+
+\subsubsection{Implementations and Results}
+\paragraph{Baseline (ReLU)}
+The baseline Naïve DQN (ReLU, batch size 64) showed significant improvement over the Q-Network. The experience replay successfully stabilized learning, allowing the policy to converge to a final evaluation mean reward of \textbf{155.00}. This is a good performance, though not optimal.
+
+\paragraph{Alternative (Tanh)}
+The alternative policy (Tanh, batch size 32, $\epsilon_{decay}=0.998$) demonstrated superior performance. The combination of Tanh activation and tuned hyperparameters allowed the agent to quickly and stably converge to the maximum possible score, achieving a final evaluation mean reward of \textbf{500.00}.
+
+\paragraph{Discussion}
+Experience replay is clearly essential. For this algorithm, the Tanh activation provided the extra stability needed to push the agent from a sub-optimal policy (155.0) to a perfect one (500.0).
+
+%------------------------------------------------------------------------------
+\subsection{DQN with Target Network (Student 3)}
+%------------------------------------------------------------------------------
+
+\subsubsection{Algorithm Description}
+DQN improves upon Naïve DQN by adding a second, separate "target network" $Q_{\theta^-}$. This target network, whose weights are periodically copied from the online network $Q_\theta$, is used to calculate the target Q-value, addressing the "moving target" problem.
+\begin{equation}
+    y = r + \gamma (1-done) \cdot \max_{a'} Q_{\theta^-}(s', a')
+\end{equation}
+\begin{equation}
+    \mathcal{L}(\theta) = \mathbb{E}_{(s,a,r,s',done) \sim \mathcal{D}}\left[\left(y - Q_\theta(s, a)\right)^2\right]
+\end{equation}
+
+\subsubsection{Implementations and Results}
+\paragraph{Baseline (ReLU)}
+A striking and critical result was observed: the baseline DQN (ReLU, \texttt{target\_update\_freq=10}) \textbf{failed to learn entirely}. The policy was extremely unstable, and the final evaluation mean reward collapsed to \textbf{9.00}. This suggests a negative interaction between the ReLU activation and the target network mechanism in this specific setup, possibly leading to dying ReLUs or unstable gradients.
+
+\paragraph{Alternative (Tanh)}
+In stark contrast, the alternative policy (Tanh, $\epsilon_{decay}=0.995$) converged perfectly. The Tanh activation, with its bounded output, provided the necessary stability for the DQN algorithm to function correctly, achieving a final evaluation mean reward of \textbf{500.00}.
+
+\paragraph{Discussion}
+This is the most dramatic finding. The addition of a target network, intended to stabilize Naïve DQN, actually \textit{destabilized} the ReLU-based model, causing total failure. Simply switching to Tanh activation fixed this catastrophic failure and resulted in a perfect policy.
+
+%------------------------------------------------------------------------------
+\subsection{Double DQN (DDQN) (Student 4)}
+%------------------------------------------------------------------------------
+
+\subsubsection{Algorithm Description}
+DDQN addresses the overestimation bias of DQN by decoupling action \textit{selection} from action \textit{evaluation}. The online network $Q_\theta$ selects the best next action, but the target network $Q_{\theta^-}$ evaluates the Q-value of that action.
+\begin{equation}
+    y = r + \gamma (1-done) \cdot Q_{\theta^-}(s', \arg\max_{a'} Q_\theta(s', a'))
+\end{equation}
+
+\subsubsection{Implementations and Results}
+\paragraph{Baseline (ReLU)}
+The baseline DDQN (ReLU, \texttt{target\_update\_freq=10}) achieved a perfect score, with a final evaluation mean reward of \textbf{500.00}. This is a key result: the DDQN update rule, by itself, was robust enough to correct the instability that caused the baseline DQN (ReLU) to fail.
+
+\paragraph{Alternative (Tanh)}
+The alternative policy (Tanh, $\epsilon_{decay}=0.9995$, \texttt{buffer\_size=30000}) also achieved a perfect score of \textbf{500.00}.
+
+\paragraph{Discussion}
+For DDQN, the choice of activation function was not critical, as the underlying algorithm was already stable enough to solve the environment with ReLU. The success of the baseline DDQN (ReLU) highlights that it's not just the target network, but \textit{how} the target is computed, that matters for stability.
+
+%==============================================================================
+\section{Cross-Policy Comparison}
+%==============================================================================
+
+\label{sec:comparison} % 修复：确保标签紧跟在section或caption后
+
+%------------------------------------------------------------------------------
+\subsection{Quantitative Comparison}
+%------------------------------------------------------------------------------
+
+\begin{table}[H]
+\centering
+\caption{Performance Comparison Across All 8 DRL Policies}
+\label{tab:all_policies_comparison} % 修复：使用新的唯一标签
+\begin{tabular}{@{}llc@{}}
+\toprule
+\textbf{Algorithm} & \textbf{Configuration (Activation)} & \textbf{Final Eval Mean Reward} \\ \midrule
+Q-Network & Baseline (ReLU) & 12.00 \\
+Q-Network & Alternative (Tanh) & 46.00 \\ \midrule
+Naïve DQN & Baseline (ReLU) & 155.00 \\
+Naïve DQN & Alternative (Tanh) & 500.00 \\ \midrule
+DQN & Baseline (ReLU) & 9.00 \\
+DQN & Alternative (Tanh) & 500.00 \\ \midrule
+DDQN & Baseline (ReLU) & 500.00 \\
+DDQN & Alternative (Tanh) & 500.00 \\ \bottomrule
+\end{tabular}
+\end{table}
+
+% TODO: Include comparison figure with all eight algorithms
+% \begin{figure}[H]
+%     \centering
+%     \includegraphics[width=0.9\textwidth]{figures/all_eight_comparison.png}
+%     \caption{Evaluation Mean Reward Comparison Across All 8 Policies}
+%     \label{fig:all_comparison}
+% \end{figure}
+
+The data clearly shows that Q-Network policies fail, Naïve DQN (ReLU) is sub-optimal, and standard DQN (ReLU) fails catastrophically. Optimal performance (500.0) was achieved by DDQN (both ReLU and Tanh) and by Naïve DQN and DQN \textit{only after} switching to Tanh activation.
+
+%------------------------------------------------------------------------------
+\subsection{Qualitative Comparison and Analysis}
+%------------------------------------------------------------------------------
+
+\subsubsection{Impact of Experience Replay}
+Comparing Q-Network (ReLU, 12.0) to Naïve DQN (ReLU, 155.0) confirms the profound impact of experience replay. Breaking temporal correlations is the first and most crucial step toward stable learning.
+
+\subsubsection{Impact of Target Network (Baseline ReLU)}
+Comparing Naïve DQN (ReLU, 155.0) to DQN (ReLU, 9.0) reveals an unexpected and critical insight: in our baseline configuration, the addition of a target network \textit{destabilized} the model, causing performance to collapse. This demonstrates that architectural additions intended to help are not guaranteed to do so, and can interact negatively with other choices (like ReLU).
+
+\subsubsection{Impact of Double Q-Learning (Baseline ReLU)}
+Comparing DQN (ReLU, 9.0) to DDQN (ReLU, 500.0) shows the power of the DDQN update rule. By decoupling selection and evaluation, DDQN fixed the exact instability that caused the standard DQN (ReLU) model to fail, achieving a perfect score.
+
+\subsubsection{Impact of Tanh Activation}
+This is the central finding from the "Alternative" policies.
+\begin{itemize}
+    \item \textbf{For Naïve DQN}: Tanh (500.0) was the key to pushing a sub-optimal policy (155.0) to perfection.
+    \item \textbf{For DQN}: Tanh (500.0) was the "fix" for the catastrophic failure of the ReLU model (9.0), restoring stability.
+    \item \textbf{For DDQN}: Tanh (500.0) was redundant, as the ReLU model (500.0) was already robust.
+\end{itemize}
+This suggests that the bounded nature of Tanh provides a level of gradient stability that ReLU, being unbounded, lacks, which proved critical for the unstable DQN algorithm.
+
+%==============================================================================
+\section{Conclusion}
+%==============================================================================
+
+This report presented a comprehensive comparison of four value-based deep reinforcement learning algorithms, evaluating both "Baseline" (ReLU) and "Alternative" (Tanh) implementations on the CartPole-v1 environment.
+
+Our experiments revealed complex and significant interactions between algorithmic design and architectural choices. The key findings are:
+\begin{enumerate}
+    \item \textbf{Baseline Instability:} The basic Q-Network (ReLU, 12.0) and, most surprisingly, the standard DQN (ReLU, 9.0) policies failed to learn. This demonstrates that adding a target network, while theoretically sound, can interact negatively with ReLU, leading to catastrophic failure in this setup.
+    \item \textbf{DDQN Robustness:} The Baseline DDQN (ReLU, 500.0) achieved a perfect score. This is a critical finding, as it shows the DDQN update rule (decoupling selection and evaluation) was robust enough on its own to correct the instability that caused the standard DQN (ReLU) to fail.
+    \item \textbf{Tanh as a Stabilizer:} The Tanh activation function was the key to unlocking performance. It stabilized the Naïve DQN, boosting its reward from 155.0 to 500.0, and it "fixed" the failed DQN implementation, raising its reward from 9.0 to 500.0.
+\end{enumerate}
+
+Overall, \textbf{optimal performance was achieved by DDQN (using either ReLU or Tanh) and by Tanh-based versions of Naïve DQN and DQN}. This highlights that while DDQN provides inherent algorithmic stability, architectural choices like bounded activation functions (Tanh) can be equally critical in preventing divergence and ensuring convergence for less stable algorithms like DQN.
+
+%==============================================================================
+% References
+%==============================================================================
+\begin{thebibliography}{9}
+
+\bibitem{dqn}
+Mnih, V., et al. (2013).
+\textit{Playing Atari with Deep Reinforcement Learning}.
+arXiv preprint arXiv:1312.5602.
+
+\bibitem{dqnnature}
+Mnih, V., et al. (2015).
+\textit{Human-level control through deep reinforcement learning}.
+Nature, 518(7540), 529-533.
+
+\bibitem{ddqn}
+Van Hasselt, H., Guez, A., \& Silver, D. (2015).
+\textit{Deep Reinforcement Learning with Double Q-learning}.
+arXiv preprint arXiv:1509.06461.
+
+\bibitem{sutton}
+Sutton, R. S., \& Barto, A. G. (2018).
+\textit{Reinforcement Learning: An Introduction} (2nd ed.).
+MIT Press.
+
+\end{thebibliography}
+
+%==============================================================================
+\newpage
+\section*{Statement of Contributions}
+%==============================================================================
+
+% TODO: Fill in actual names and specific contributions
+
+\begin{itemize}
+    \item \textbf{Student 1 (Peng Kehan, CEG25049):} Implemented Q-Network baseline and alternative policies, designed experiments on epsilon decay strategy, produced all plots and analysis for Section 3.1, contributed to cross-policy comparison.
+    
+    \item \textbf{Student 2 (Yang Mingchuan, CEG25083):} Implemented Naïve DQN with experience replay, explored different replay buffer sizes and sampling strategies, wrote Section 3.2, contributed to shared architecture design.
+    
+    \item \textbf{Student 3 (Yu Chijin, CEG25089):} Implemented DQN with separate target network, investigated target network update frequency effects, analyzed stability improvements in Section 3.3, contributed to hyperparameter tuning strategy.
+    
+    \item \textbf{Student 4 (Liu Pengxiang, CEG25039):} Implemented DDQN algorithm, compared against DQN in terms of overestimation bias and final performance, wrote Section 3.4, contributed to computational cost analysis.
+    
+    \item \textbf{All authors:} Collaboratively designed the shared neural network architecture, selected baseline and alternative hyperparameter sets, contributed to cross-policy comparison (Section 4), participated in discussions and report editing.
+\end{itemize}
+
+\subsection*{Individual Workload Distribution}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Task} & \textbf{Student 1} & \textbf{Student 2} & \textbf{Student 3} & \textbf{Student 4} \\ \midrule
+Algorithm Implementation & 25\% & 25\% & 25\% & 25\% \\
+Experiments \& Data Collection & 25\% & 25\% & 25\% & 25\% \\
+Individual Section Writing & 25\% & 25\% & 25\% & 25\% \\
+Shared Sections \& Editing & 25\% & 25\% & 25\% & 25\% \\
+\midrule
+\textbf{Total Contribution} & \textbf{25\%} & \textbf{25\%} & \textbf{25\%} & \textbf{25\%} \\
+\bottomrule
+\end{tabular}
+\caption{Percentage contribution breakdown by student}
+\end{table}
+
+All group members contributed equally to this project through balanced distribution of implementation, experimentation, analysis, and writing tasks. Regular group meetings ensured coordination and knowledge sharing across all algorithm implementations.
+
+\end{document}
